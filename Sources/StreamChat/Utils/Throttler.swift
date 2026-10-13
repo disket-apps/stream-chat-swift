@@ -9,6 +9,10 @@ import Foundation
 /// The API is based on the implementation from Apple:
 /// https://developer.apple.com/documentation/combine/anypublisher/throttle(for:scheduler:latest:)
 public class Throttler {
+    // `execute` is called from the main thread while the work item runs on `queue`: every access to the
+    // mutable state goes through `lock`. Unsynchronised, the two threads raced on `workItem` and freed a
+    // DispatchWorkItem still in use (SIGABRT « deallocated with non-zero retain count », EXC_BAD_ACCESS).
+    private let lock = NSLock()
     private var workItem: DispatchWorkItem?
     private let queue: DispatchQueue
     private var previousRun: Date = Date.distantPast
@@ -36,19 +40,32 @@ public class Throttler {
     /// if the last action executed was past the interval provided. If not, it will only be executed after a delay.
     /// - Parameter action: The closure to be performed.
     public func execute(_ action: @escaping () -> Void) {
-        workItem?.cancel()
-
+        let token = Token()
         let workItem = DispatchWorkItem { [weak self] in
-            guard let workItem = self?.workItem, !workItem.isCancelled else { return }
+            guard let self else { return }
+            self.lock.lock()
+            let isCurrent = self.workItem.map { !$0.isCancelled && self.currentToken === token } ?? false
+            self.lock.unlock()
+            guard isCurrent else { return }
             action()
-            self?.previousRun = Date()
-            self?.workItem = nil
+            self.lock.lock()
+            self.previousRun = Date()
+            if self.currentToken === token {
+                self.workItem = nil
+                self.currentToken = nil
+            }
+            self.lock.unlock()
         }
 
+        lock.lock()
+        self.workItem?.cancel()
         self.workItem = workItem
-
+        self.currentToken = token
         let timeSinceLastRun = Date().timeIntervalSince(previousRun)
-        let delay = timeSinceLastRun > interval ? 0 : interval
+        let currentInterval = interval
+        lock.unlock()
+
+        let delay = timeSinceLastRun > currentInterval ? 0 : currentInterval
         // If the delay is 0, we always execute the action immediately.
         // If the delay is bigger than 0, we only execute it if `latest` was enabled.
         if delay == 0 || delay > 0 && broadcastLatestEvent {
@@ -58,7 +75,14 @@ public class Throttler {
 
     /// Cancel any active action.
     public func cancel() {
+        lock.lock()
         workItem?.cancel()
         workItem = nil
+        currentToken = nil
+        lock.unlock()
     }
+
+    /// Identifies the latest scheduled action without the work item capturing itself.
+    private final class Token {}
+    private var currentToken: Token?
 }
